@@ -770,3 +770,37 @@ fn extract_keeps_the_union_when_the_part_has_both_pages() {
     assert!(names.iter().any(|n| n.as_slice() == b"ImA"));
     assert!(names.iter().any(|n| n.as_slice() == b"ImB"));
 }
+
+/// Like `doc_images`, but the second page's content can't be decoded and the first page also
+/// lists a font: pruning must not guess what the unreadable page draws.
+fn doc_images_with(page2_content: &str, font: &str) -> Document {
+    let b: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] /Resources 7 0 R >>".into(),
+        "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>".into(),
+        "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".into(),
+        raw("/ImA Do"),
+        page2_content.into(),
+        format!("<< /XObject << /ImA 8 0 R /ImB 9 0 R >> {font} >>"),
+        image(1, 1, 1),
+        image(1, 1, 2000),
+    ];
+    open(build(&b, "/Root 1 0 R"))
+}
+
+#[test]
+fn extract_keeps_images_an_undecodable_page_might_draw() {
+    let bogus = "<< /Length 7 /Filter /NoSuchFilter >>\nstream\n/ImB Do\nendstream";
+    let part = full_roundtrip(&extract_pages(&doc_images_with(bogus, ""), &[0, 1]).unwrap());
+    let names = xobject_names(&part, 0);
+    assert!(names.iter().any(|n| n.as_slice() == b"ImB"), "an image the unreadable page may draw must stay");
+}
+
+#[test]
+fn extract_keeps_images_type3_glyphs_may_draw() {
+    // A Type 3 font without its own /Resources draws through the page's: its glyphs could `Do`.
+    let font = "/Font << /T3 << /Type /Font /Subtype /Type3 /FontBBox [0 0 1 1] /FontMatrix [1 0 0 1 0 0] /CharProcs << >> /Encoding << /Differences [] >> /FirstChar 0 /LastChar 0 /Widths [0] >> >>";
+    let part = full_roundtrip(&extract_pages(&doc_images_with(&raw("/ImB Do"), font), &[0]).unwrap());
+    let names = xobject_names(&part, 0);
+    assert!(names.iter().any(|n| n.as_slice() == b"ImB"), "pruning must not run through Type 3 resources");
+}

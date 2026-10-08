@@ -38,9 +38,30 @@ enum Owner {
 struct Pruner<'a> {
     doc: &'a Document,
     used: HashMap<XKey, HashSet<Vec<u8>>>,
+    /// Dictionaries whose drawn names can't be known for certain (undecodable content, nesting
+    /// past the depth limit, Type 3 glyphs drawing through them). They are left untouched:
+    /// pruning must never drop an XObject something still draws.
+    unsure: HashSet<XKey>,
 }
 
 impl Pruner<'_> {
+    /// Mark the `/XObject` dictionary of `resources` as one not to prune.
+    fn distrust(&mut self, resources: &Dict, owner: Owner) {
+        if let Some((_, key)) = self.xobjects(resources, owner) {
+            self.unsure.insert(key);
+        }
+    }
+
+    /// True when `resources` lists a Type 3 font without its own `/Resources`: its glyph
+    /// procedures draw through these resources, and they are not followed here.
+    fn has_inheriting_type3(&self, resources: &Dict) -> bool {
+        let Some(fonts) = resources.get(b"Font").map(|f| self.doc.resolve(f)) else { return false };
+        let Some(fonts) = fonts.as_dict() else { return false };
+        fonts
+            .iter()
+            .any(|(_, f)| self.doc.resolve(f).as_dict().is_some_and(|fd| fd.name(b"Subtype") == Some(b"Type3") && fd.get(b"Resources").is_none()))
+    }
+
     /// The `/XObject` dictionary of `resources`, with the key its drawn names belong to.
     fn xobjects(&self, resources: &Dict, owner: Owner) -> Option<(Dict, XKey)> {
         let x = resources.get(b"XObject")?;
@@ -56,12 +77,13 @@ impl Pruner<'_> {
 
     /// Record every XObject name `data` draws with `Do`, descending into form XObjects.
     fn content(&mut self, data: &[u8], resources: &Dict, owner: Owner, depth: u8) {
-        if depth > MAX_FORM_DEPTH {
-            return;
-        }
         let Some((xobjects, key)) = self.xobjects(resources, owner) else {
             return;
         };
+        if depth > MAX_FORM_DEPTH || self.has_inheriting_type3(resources) {
+            self.unsure.insert(key);
+            return;
+        }
         for op in pdfcraft_content::parse(data).ops {
             if op.op.as_slice() != b"Do" {
                 continue;
@@ -88,27 +110,31 @@ impl Pruner<'_> {
                 // A form without its own resources draws against the ones it was invoked with.
                 None => (resources.clone(), owner),
             };
-            self.content(&s.decoded().unwrap_or_default(), &inner, inner_owner, depth + 1);
+            match s.decoded() {
+                Ok(data) => self.content(&data, &inner, inner_owner, depth + 1),
+                // What the form draws is unknown: keep everything it could reach.
+                Err(_) => self.distrust(&inner, inner_owner),
+            }
         }
     }
 }
 
-/// The page's content, concatenated (`/Contents` may be one stream or an array).
-fn content_bytes(doc: &Document, contents: &Object) -> Vec<u8> {
+/// The page's content, concatenated (`/Contents` may be one stream or an array). `None` when a
+/// stream can't be decoded: the page may draw names that can't be seen.
+fn content_bytes(doc: &Document, contents: &Object) -> Option<Vec<u8>> {
     match &*doc.resolve(contents) {
-        Object::Stream(s) => s.decoded().unwrap_or_default(),
-        Object::Array(a) => a
-            .iter()
-            .flat_map(|c| match &*doc.resolve(c) {
-                Object::Stream(s) => {
-                    let mut v = s.decoded().unwrap_or_default();
-                    v.push(b'\n');
-                    v
+        Object::Stream(s) => s.decoded().ok(),
+        Object::Array(a) => {
+            let mut out = Vec::new();
+            for c in a {
+                if let Object::Stream(s) = &*doc.resolve(c) {
+                    out.extend(s.decoded().ok()?);
+                    out.push(b'\n');
                 }
-                _ => Vec::new(),
-            })
-            .collect(),
-        _ => Vec::new(),
+            }
+            Some(out)
+        }
+        _ => Some(Vec::new()),
     }
 }
 
@@ -176,22 +202,24 @@ fn filter_at(doc: &mut Document, key: XKey, names: &HashSet<Vec<u8>>) -> Result<
 /// Drop the page-resource entries the document's pages never draw. Returns how many were removed.
 pub(crate) fn prune_unused_xobjects(doc: &mut Document) -> Result<usize, OrganizeError> {
     let pages = crate::walk(doc)?;
-    let mut pruner = Pruner { doc, used: HashMap::new() };
+    let mut pruner = Pruner { doc, used: HashMap::new(), unsure: HashSet::new() };
     for (page, attrs) in &pages {
         let Some(res) = attrs.get(b"Resources") else { continue };
+        let Some((res_dict, owner)) = resolve_resources(pruner.doc, res, *page) else { continue };
         let Some(pd) = pruner.doc.get(*page).as_dict().cloned() else { continue };
         let Some(contents) = pd.get(b"Contents").cloned() else { continue };
-        let data = content_bytes(pruner.doc, &contents);
-        if data.is_empty() {
-            continue;
+        match content_bytes(pruner.doc, &contents) {
+            Some(data) if data.is_empty() => {}
+            Some(data) => pruner.content(&data, &res_dict, owner, 0),
+            None => pruner.distrust(&res_dict, owner),
         }
-        let Some((res_dict, owner)) = resolve_resources(pruner.doc, res, *page) else { continue };
-        pruner.content(&data, &res_dict, owner, 0);
     }
-    let used = pruner.used;
+    let Pruner { used, unsure, .. } = pruner;
     let mut removed = 0;
     for (key, names) in used {
-        removed += filter_at(doc, key, &names)?;
+        if !unsure.contains(&key) {
+            removed += filter_at(doc, key, &names)?;
+        }
     }
     Ok(removed)
 }
