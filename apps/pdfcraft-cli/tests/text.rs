@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_printcraft-cli");
+const BIN: &str = env!("CARGO_BIN_EXE_pdfcraft-cli");
 
 /// A PDF with `n` 200×300 pt pages reading "Page 1", "Page 2", …
 fn fixture(n: usize) -> Vec<u8> {
@@ -33,7 +33,7 @@ fn fixture(n: usize) -> Vec<u8> {
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("printcraft-cli-text-{}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("pdfcraft-cli-text-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d.join(name)
 }
